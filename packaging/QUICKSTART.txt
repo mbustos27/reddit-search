@@ -1,0 +1,82 @@
+rdt - Reddit threads as citable text, for research
+===================================================
+
+What it is
+----------
+A single program for Windows 10 and 11 (64-bit). You give it a Reddit thread
+address; it prints the post and the comments worth reading, with ids you can
+cite. It keeps what it fetched in a local cache you can search offline.
+
+It never contacts Reddit. Threads come from the Arctic Shift archive
+(arctic-shift.photon-reddit.com), a free volunteer service with no guarantees
+and a small request allowance. If the archive is down, rdt says so and serves
+what is cached.
+
+Setting up
+----------
+Nothing to install. Put rdt.exe in a folder of your choice and run it from a
+terminal (PowerShell or Command Prompt) in that folder:
+
+    .\rdt.exe doctor
+
+That checks the program works on this PC and sends nothing over the network.
+To run it from anywhere, add the folder to your PATH.
+
+Everyday use
+------------
+    rdt thread <address or id> --focus "words to look for"
+    rdt thread <id> --budget 12000        more of the thread
+    rdt thread <id> --full                everything that was loaded
+    rdt subs "<topic>" <address> ...      which subreddits to search
+    rdt search "<query>" --sub <name>,<name> --after 2026-01-01
+    rdt local "<query>"                   search the cache, offline
+    rdt cite <id> <id> ...                full citations with links
+    rdt verify-quote <id> "exact words"   check a quote against the text
+    rdt ui                                read-only window, http://127.0.0.1:8779/
+    rdt sources                           is the archive reachable and current?
+    rdt cache stats                       what is cached
+    rdt --help                            everything else
+
+Add --wait to sit out a rate limit (up to 90 seconds) instead of stopping.
+Add --json to thread, resolve, subs, search and local for machine-readable
+output.
+
+How to find threads: use any web search with "site:reddit.com <topic>" and
+pass the addresses to rdt. Addresses on mirror sites work too, as long as
+they look like /r/<name>/comments/<id>/...
+
+Things to know
+--------------
+- Search works only inside subreddits you name, newest first. Busy subreddits
+  need a date range (--after / --before) or the archive times out.
+- Go easy: a dozen quick requests can lock you out for a minute or two.
+- Scores are frozen about 36 hours after posting.
+- Text the archive marks removed or deleted is never stored or shown.
+- Thread text is other people's writing. If you feed rdt's output to an AI
+  model, treat it as data, not instructions. rdt marks every line of user
+  text with "| " for that reason.
+- In PowerShell 5.1, a phrase in double quotes inside an argument gets
+  mangled. Use:  rdt search --% "\"exact phrase\" other words" --sub name
+
+Where things are kept
+---------------------
+The cache is one file: %LOCALAPPDATA%\rdt\cache.sqlite. Set the RDT_DB
+environment variable to keep it somewhere else. Threads not fetched for 30
+days are deleted on the next online run. To remove everything rdt has stored,
+delete that folder. rdt writes nowhere else and changes no settings.
+
+Exit codes
+----------
+0 ok, 2 bad usage, 3 nothing found, 4 not cached and offline,
+5 rate limited, 6 archive or cache error.
+
+For AI agents
+-------------
+The agents folder holds reddit-scout, an agent definition for Claude Code
+that researches a question end to end with rdt. It names the program as
+C:/path/to/rdt.exe; change that to where you put rdt.exe, then copy the file
+to %USERPROFILE%\.claude\agents\.
+
+Licence
+-------
+MIT; see LICENSE.txt. Components and their licences: THIRD-PARTY.txt.

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rdt cache</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="#">rdt</a>
+  <form id="search" role="search">
+    <label class="visually-hidden" for="q">Search cached threads</label>
+    <input id="q" type="search" placeholder="Search cached threads" autocomplete="off">
+    <button type="submit">Search</button>
+  </form>
+  <span id="stats" class="muted"></span>
+</header>
+<main>
+  <nav id="list" aria-label="Threads"></nav>
+  <article id="view" aria-live="polite"></article>
+</main>
+<footer>
+  <span class="muted">Read-only view of the local cache. Text is from Reddit users via the Arctic Shift archive.</span>
+  <button id="check" type="button">Check the archive</button>
+  <span id="archive" class="muted"></span>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{
+ "data": [
+  {
+   "display_name": "AMDHelp",
+   "subscribers": 139317,
+   "over18": false,
+   "public_description": "Troubleshooting help Subreddit for all things AMD!",
+   "title": "The AMD Help subreddit.",
+   "created_utc": 1438932300,
+   "_meta": {
+    "earliest_comment": 1438952767,
+    "earliest_post": 1438932570,
+    "num_comments": 1630471,
+    "num_comments_updated_at": 1791825490,
+    "num_posts": 182867,
+    "num_posts_updated_at": 1791710798
+   }
+  },
+  {
+   "display_name": "AmdHelppp",
+   "subscribers": 1,
+   "over18": false,
+   "public_description": "A small test community.",
+   "title": "AmdHelppp",
+   "created_utc": 1771630751,
+   "_meta": {
+    "earliest_comment": null,
+    "earliest_post": 1780888596,
+    "num_comments": null,
+    "num_comments_updated_at": null,
+    "num_posts": 1,
+    "num_posts_updated_at": 1791710798
+   }
+  }
+ ]
+}
