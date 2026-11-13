@@ -490,7 +490,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rdt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "reddit_core",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "reddit_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "reddit_sources"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reddit_core",
  "serde_json",

@@ -5,5 +5,6 @@ pub mod model;
 pub mod rank;
 pub mod render;
 pub mod select;
+pub mod starter;
 pub mod store;
 pub mod text;

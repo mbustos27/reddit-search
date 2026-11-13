@@ -5,7 +5,7 @@ use reddit_core::model::State;
 use reddit_core::rank::{self, Candidate};
 use reddit_core::render::{self, SearchMeta, ThreadView};
 use reddit_core::select::{self, Options};
-use reddit_core::store::Store;
+use reddit_core::store::{Budget, Store};
 use reddit_core::text;
 use reddit_sources::arctic::{self, Arctic, Error, Query};
 use reddit_sources::transport::{Clock, Transport};
@@ -24,12 +24,82 @@ pub struct Fail {
     pub code: i32,
     pub message: String,
     pub retry_after_s: Option<u64>,
+    /// What a search covered before it stopped, for `--json`.
+    pub coverage: Option<serde_json::Value>,
 }
 
 impl Fail {
     pub fn new(code: i32, message: impl Into<String>) -> Fail {
-        Fail { code, message: message.into(), retry_after_s: None }
+        Fail { code, message: message.into(), retry_after_s: None, coverage: None }
     }
+}
+
+/// A line for stderr, shown as it happens. Tests stay quiet.
+fn warn(line: &str) {
+    if !cfg!(test) {
+        eprintln!("rdt: {line}");
+    }
+}
+
+/// Said before a search sends anything, when the machine-wide budget cannot carry it at full pace.
+pub fn budget_warning(b: &Budget, planned: usize, now_ms: u64) -> Option<String> {
+    let secs = |at: u64| at.saturating_sub(now_ms).div_ceil(1000);
+    if let Some(until) = b.blocked_until_ms {
+        return Some(format!(
+            "rate limited, retry in {} s: the archive limited an rdt run on this PC; nothing is sent until then (with --wait, up to 90 s is waited out)",
+            secs(until)
+        ));
+    }
+    if (b.left() as usize) < planned {
+        let free = b.frees_at_ms.map(|t| format!("; the next slot frees in {} s", secs(t))).unwrap_or_default();
+        return Some(format!(
+            "budget low: {} of {} requests left this minute, shared by every rdt run on this PC; this search needs about {planned}, so it will pause for slots{free}",
+            b.left(),
+            b.cap
+        ));
+    }
+    None
+}
+
+/// The coverage status of a subreddit whose search failed.
+fn status_of(e: &Error) -> &'static str {
+    match e {
+        Error::TooBroad(_) => "timed_out",
+        Error::RateLimited { .. } => "rate_limited",
+        Error::Busy { .. } => "budget_used_up",
+        _ => "failed",
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Narrow {
+    /// Search only from this date on; the reason, for the report.
+    After(String, String),
+    /// Search for fewer words.
+    Text(String, String),
+}
+
+/// How to retry a query the archive timed out on, narrower: first a shorter date window (the last 180 days, or the
+/// newer half of the given window while it is longer than 30 days), then only the first two words.
+pub fn narrower(query: &str, after: Option<&str>, before: Option<&str>, now: i64) -> Option<Narrow> {
+    const DAY: i64 = 86_400;
+    let end = before.and_then(text::epoch).unwrap_or(now);
+    let start = after.and_then(text::epoch);
+    let from = match start {
+        None => Some(end - 180 * DAY),
+        Some(s) if end - s > 30 * DAY => Some(s + (end - s) / 2),
+        Some(_) => None,
+    };
+    if let Some(from) = from {
+        let d = text::date(from);
+        return Some(Narrow::After(d.clone(), format!("searched only from {d}; the older part of the range was dropped")));
+    }
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() > 2 && !query.contains('"') {
+        let kept = words[..2].join(" ");
+        return Some(Narrow::Text(kept.clone(), format!("searched for \"{kept}\" only; dropped \"{}\"", words[2..].join(" "))));
+    }
+    None
 }
 
 impl From<reddit_core::store::Error> for Fail {
@@ -42,11 +112,11 @@ impl From<Error> for Fail {
     fn from(e: Error) -> Fail {
         let (code, retry) = match &e {
             Error::NotFound(_) => (3, None),
-            Error::RateLimited { retry_after_s } => (5, Some(*retry_after_s)),
+            Error::RateLimited { retry_after_s } | Error::Busy { retry_after_s } => (5, Some(*retry_after_s)),
             Error::Unsupported(_) => (2, None),
             Error::Refused(_) | Error::TooBroad(_) | Error::Unavailable(_) => (6, None),
         };
-        Fail { code, message: e.to_string(), retry_after_s: retry }
+        Fail { code, message: e.to_string(), retry_after_s: retry, coverage: None }
     }
 }
 
@@ -59,8 +129,13 @@ pub struct Ctx<'a, T: Transport, C: Clock> {
 
 impl<T: Transport, C: Clock> Ctx<'_, T, C> {
     /// Writes the requests made so far to the cache's request log (endpoint and status only).
+    /// With a ledger the requests are already booked there, so this only clears the run's own list.
     pub fn flush_log(&self) {
-        for (endpoint, status) in self.arctic.log.borrow_mut().drain(..) {
+        let made: Vec<(String, u16)> = self.arctic.log.borrow_mut().drain(..).collect();
+        if self.arctic.has_ledger() {
+            return;
+        }
+        for (endpoint, status) in made {
             let _ = self.store.log_request(self.now, arctic::NAME, &endpoint, status);
         }
     }
@@ -242,6 +317,8 @@ pub fn search<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SearchArgs) -> Re
     let mut lists: Vec<(String, Vec<String>)> = Vec::new();
     let mut found: HashMap<String, Candidate> = HashMap::new();
     let mut stopped: Option<Fail> = None;
+    let mut coverage: Vec<serde_json::Value> = Vec::new();
+    let mut budget_note: Option<String> = None;
 
     if a.offline {
         sources.push("arctic: not asked (offline)".to_owned());
@@ -251,12 +328,60 @@ pub fn search<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SearchArgs) -> Re
         if subs.len() > MAX_SUBS {
             sources.push(format!("arctic: only the first {MAX_SUBS} subreddits were searched"));
         }
-        'subs: for sub in subs.iter().take(MAX_SUBS) {
-            let q = Query { subreddit: sub, text: &a.query, after: a.after.as_deref(), before: a.before.as_deref(), limit: 25 };
-            match ctx.arctic.search_posts(&q) {
+        // Say before anything is sent whether the machine-wide budget can carry this search.
+        let planned = subs.len().min(MAX_SUBS) * if a.comments { 2 } else { 1 };
+        if let Some(b) = ctx.arctic.budget() {
+            budget_note = budget_warning(&b, planned, ctx.arctic.now_ms());
+            if let Some(n) = &budget_note {
+                warn(n);
+            }
+        }
+        // Timed-out searches are retried here, narrower and once per subreddit, never also by the client.
+        ctx.arctic.take_timeout_retry();
+        let mut retries_open = true;
+        'subs: for (i, sub) in subs.iter().take(MAX_SUBS).enumerate() {
+            let mut q = Query { subreddit: sub, text: &a.query, after: a.after.as_deref(), before: a.before.as_deref(), limit: 25 };
+            let mut narrowed: Option<String> = None;
+            let narrow_after;
+            let narrow_text;
+            let mut result = ctx.arctic.search_posts(&q);
+            if matches!(result, Err(Error::TooBroad(_))) && retries_open {
+                match narrower(&a.query, a.after.as_deref(), a.before.as_deref(), ctx.now) {
+                    Some(Narrow::After(d, why)) => {
+                        narrow_after = d;
+                        q.after = Some(&narrow_after);
+                        narrowed = Some(why);
+                    }
+                    Some(Narrow::Text(t, why)) => {
+                        narrow_text = t;
+                        q.text = &narrow_text;
+                        narrowed = Some(why);
+                    }
+                    None => {}
+                }
+                if narrowed.is_some() {
+                    // One narrower retry per run, whatever its answer: the same allowance the old blind retry had,
+                    // so a run never sends more requests than before. Later timeouts are reported in the coverage.
+                    retries_open = false;
+                    ctx.arctic.pause_after_timeout();
+                    // Sent once: a rate limit on the retry is reported, not waited out and tried a third time.
+                    result = ctx.arctic.search_posts_once(&q);
+                }
+            }
+            match result {
                 Ok(posts) => {
-                    sources.push(format!("arctic r/{sub}: {} posts (newest first; the archive has no relevance order)", posts.len()));
+                    let note = narrowed.as_deref().map(|w| format!("; narrowed after a timeout: {w}")).unwrap_or_default();
+                    sources.push(format!("arctic r/{sub}: {} posts (newest first; the archive has no relevance order){note}", posts.len()));
                     lists.push((format!("arctic:{sub}"), posts.iter().map(|p| p.id.clone()).collect()));
+                    let full = posts.len() >= q.limit;
+                    let oldest = posts.iter().map(|p| p.created).min();
+                    coverage.push(serde_json::json!({
+                        "subreddit": sub, "status": if narrowed.is_some() { "narrowed" } else { "answered" }, "posts": posts.len(),
+                        "after": q.after, "before": q.before, "query": q.text, "narrowed": narrowed,
+                        // A full page means older matches exist that were not seen: coverage reaches back only this far.
+                        "reached_back_to": if full { oldest.map(text::date) } else { q.after.map(str::to_owned) },
+                        "page_full": full,
+                    }));
                     for p in posts {
                         ctx.store.save_post(&p, arctic::NAME, ctx.now)?;
                         found.entry(p.id.clone()).or_insert(Candidate { post: p, comments: Vec::new(), cached_comments: false });
@@ -264,7 +389,11 @@ pub fn search<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SearchArgs) -> Re
                 }
                 Err(e) => {
                     sources.push(format!("arctic r/{sub}: {e}"));
-                    if matches!(e, Error::RateLimited { .. } | Error::Refused(_) | Error::Unavailable(_)) {
+                    coverage.push(serde_json::json!({"subreddit": sub, "status": status_of(&e), "error": e.to_string(), "narrowed": narrowed}));
+                    if matches!(e, Error::RateLimited { .. } | Error::Busy { .. } | Error::Refused(_) | Error::Unavailable(_)) {
+                        for rest in subs.iter().take(MAX_SUBS).skip(i + 1) {
+                            coverage.push(serde_json::json!({"subreddit": rest, "status": "not_reached"}));
+                        }
                         stopped = Some(e.into());
                         break 'subs;
                     }
@@ -295,11 +424,36 @@ pub fn search<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SearchArgs) -> Re
                         }
                         lists.push((format!("arctic-comments:{sub}"), order));
                     }
-                    Err(e) => sources.push(format!("arctic r/{sub} comments: {e}")),
+                    Err(e) => {
+                        sources.push(format!("arctic r/{sub} comments: {e}"));
+                        if let Some(row) = coverage.last_mut() {
+                            row["comments"] = serde_json::json!(status_of(&e));
+                        }
+                    }
                 }
             }
         }
+        for rest in subs.iter().skip(MAX_SUBS) {
+            coverage.push(serde_json::json!({"subreddit": rest, "status": "skipped", "error": format!("only {MAX_SUBS} subreddits are searched per run")}));
+        }
     }
+    let by = |status: &str| -> Vec<serde_json::Value> { coverage.iter().filter(|r| r["status"] == status).map(|r| r["subreddit"].clone()).collect() };
+    let coverage_block = serde_json::json!({
+        "offline": a.offline,
+        "asked": subs,
+        "answered": coverage.iter().filter(|r| r["status"] == "answered" || r["status"] == "narrowed").map(|r| r["subreddit"].clone()).collect::<Vec<_>>(),
+        "narrowed": by("narrowed"),
+        "timed_out": by("timed_out"),
+        "rate_limited": by("rate_limited"),
+        "budget_used_up": by("budget_used_up"),
+        "failed": by("failed"),
+        "not_reached": by("not_reached"),
+        "skipped": by("skipped"),
+        "comments_searched": a.comments && !a.offline,
+        "requested": {"after": a.after, "before": a.before},
+        "subreddits": coverage,
+        "budget_note": budget_note,
+    });
 
     let matches = ctx.store.matches(&terms, 50)?;
     let mut cache_order = Vec::new();
@@ -331,13 +485,15 @@ pub fn search<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SearchArgs) -> Re
     ranked.truncate(a.limit.max(1));
 
     if ranked.is_empty() {
-        return Err(match stopped {
+        let mut fail = match stopped {
             Some(f) => f,
             None => Fail::new(3, format!("nothing found for \"{}\". {}", a.query, sources.join("; "))),
-        });
+        };
+        fail.coverage = Some(coverage_block);
+        return Err(fail);
     }
     let _ = total;
-    let meta = SearchMeta { query: &a.query, now: ctx.now, nonce: ctx.nonce, sources, candidates: folded, explain: a.explain };
+    let meta = SearchMeta { query: &a.query, now: ctx.now, nonce: ctx.nonce, sources, candidates: folded, explain: a.explain, coverage: Some(coverage_block) };
     Ok(if a.json { format!("{}\n", render::search_json(&ranked, &meta)) } else { render::search_text(&ranked, &meta) })
 }
 
@@ -485,6 +641,8 @@ pub struct SubsArgs {
 /// Name lookups for words of the topic, and checks of the leading candidates: the archive's allowance is small.
 const MAX_NAME_LOOKUPS: usize = 2;
 const MAX_CHECKS: usize = 4;
+/// How many subreddits the built-in starter list may propose for one topic.
+const MAX_STARTERS: usize = 6;
 /// Names are matched by prefix, largest first; a full page with no exact match proves nothing about a small namesake.
 const LOOKUP_PAGE: usize = 100;
 /// Above this many archived posts a text search usually needs a date range; far above it, it usually times out.
@@ -502,6 +660,15 @@ struct SubCandidate {
     checked: bool,
     /// A cached thread in it is marked over-18, known even when the archive was not asked.
     over_18: bool,
+    /// Proposed by the built-in starter list: its rank there and the topic word that brought it in.
+    starter: Option<(usize, &'static str)>,
+}
+
+impl SubCandidate {
+    /// URLs and cached threads are evidence; a starter-list entry alone is only a guess and costs no lookups.
+    fn evidence(&self) -> usize {
+        self.urls + self.cached
+    }
 }
 
 fn compact(n: i64) -> String {
@@ -574,6 +741,18 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
     }
     sources.push(format!("cache: {on_topic} threads on the topic"));
 
+    // Web searches often find no Reddit URLs at all: when neither URLs nor the cache gave anything, the built-in list
+    // proposes subreddits from the topic words. Real evidence, when there is any, is never diluted by guesses.
+    let starters = if found.is_empty() { reddit_core::starter::for_topic(&a.topic, MAX_STARTERS) } else { Vec::new() };
+    for (i, s) in starters.iter().enumerate() {
+        if let Some(c) = candidate(&mut found, s.name) {
+            c.starter.get_or_insert((i, s.because));
+        }
+    }
+    if !starters.is_empty() {
+        sources.push(format!("starter list: {} subreddits from the topic words (not checked against the archive)", starters.len()));
+    }
+
     // What earlier runs learned costs nothing and is used offline too. A "no such subreddit" answer is trusted
     // for a day only: the archive's list lags, and a wrong "no" should not stick.
     let (fresh, fresh_missing) = (ctx.now - KEEP_DAYS * 86_400, ctx.now - 86_400);
@@ -607,7 +786,8 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
             }
         };
         // First confirm the candidates the URLs and the cache gave, and learn their size: they are the real signal.
-        let mut order: Vec<(String, usize)> = found.iter().filter(|(_, c)| !c.checked).map(|(k, c)| (k.clone(), c.urls * 3 + c.cached * 2)).collect();
+        let mut order: Vec<(String, usize)> =
+            found.iter().filter(|(_, c)| !c.checked && c.evidence() > 0).map(|(k, c)| (k.clone(), c.urls * 3 + c.cached * 2)).collect();
         order.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
         for (key, _) in order.into_iter().take(MAX_CHECKS) {
             if let Some((list, full_page)) = ask(&key, &mut stopped) {
@@ -621,7 +801,7 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
         }
         // Only when that left little to go on: a topic word may itself be a subreddit name ("thinkpad").
         // Tiny namesakes are ignored. These answers are remembered like the others.
-        if found.len() < 2 {
+        if found.values().filter(|c| c.evidence() > 0).count() < 2 {
             let words: Vec<&String> =
                 terms.iter().filter(|t| t.len() >= 5 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).take(MAX_NAME_LOOKUPS).collect();
             for w in words {
@@ -663,7 +843,7 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
 
     let score = |c: &SubCandidate| {
         let size = c.info.as_ref().and_then(|i| i.subscribers).unwrap_or(0).max(1) as f64;
-        (c.urls * 3 + c.cached * 2) as f64 + if c.name_match { 1.0 + size.log10() / 6.0 } else { 0.0 }
+        (c.urls * 3 + c.cached * 2) as f64 + if c.name_match { 1.0 + size.log10() / 6.0 } else { 0.0 } + c.starter.map_or(0.0, |(i, _)| 1.0 - i as f64 * 0.05)
     };
     let mut list: Vec<SubCandidate> = found.into_values().filter(|c| a.nsfw || !(c.over_18 || c.info.as_ref().is_some_and(|i| i.over_18))).collect();
     list.sort_by(|x, y| score(y).total_cmp(&score(x)).then(x.name.to_lowercase().cmp(&y.name.to_lowercase())));
@@ -691,6 +871,9 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
         if c.name_match {
             parts.push("a topic word is its name".to_owned());
         }
+        if let Some((_, word)) = c.starter {
+            parts.push(format!("starter list ({word})"));
+        }
         parts.join(", ")
     };
     // Suggest searching the ones that exist as far as we know. A very busy subreddit would time out the whole
@@ -701,7 +884,8 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
     let (picked, days) = if searchable.is_empty() {
         (&too_busy, Some(30))
     } else {
-        (&searchable, searchable.iter().take(MAX_SUBS).any(|c| posts(c) >= BUSY_POSTS).then_some(365))
+        // A starter-list name of unknown size may be busy: a year's window costs nothing and saves a timed-out request.
+        (&searchable, searchable.iter().take(MAX_SUBS).any(|c| posts(c) >= BUSY_POSTS || (c.starter.is_some() && c.info.is_none())).then_some(365))
     };
     let next = (!picked.is_empty()).then(|| {
         let names: Vec<&str> = picked.iter().take(MAX_SUBS).map(|c| c.name.as_str()).collect();
@@ -719,6 +903,7 @@ pub fn subs<T: Transport, C: Clock>(ctx: &mut Ctx<T, C>, a: &SubsArgs) -> Result
                     "name": c.name, "urls": c.urls, "cached_threads": c.cached, "name_match": c.name_match, "checked": c.checked,
                     "in_archive": c.checked.then_some(i.is_some()), "subscribers": i.and_then(|i| i.subscribers), "archived_posts": i.and_then(|i| i.posts),
                     "over_18": i.map(|i| i.over_18), "description": i.map(|i| render::attr(&i.description)), "search_note": size_note(c),
+                    "starter": c.starter.map(|(_, w)| w),
                 })
             })
             .collect();
@@ -787,6 +972,17 @@ pub fn sources<T: Transport, C: Clock>(ctx: &Ctx<T, C>) -> Result<String, Fail> 
         s.comments,
         ctx.store.requests_since(ctx.now - 3600)?
     );
+    if let Some(b) = ctx.arctic.budget() {
+        let now_ms = ctx.arctic.now_ms();
+        let secs = |at: u64| at.saturating_sub(now_ms).div_ceil(1000);
+        let _ = write!(out, "budget   {} of {} requests left this minute, shared by every rdt run on this PC", b.left(), b.cap);
+        if let Some(until) = b.blocked_until_ms {
+            let _ = write!(out, "; rate limited, retry in {} s", secs(until));
+        } else if let Some(t) = b.frees_at_ms {
+            let _ = write!(out, "; the next slot frees in {} s", secs(t));
+        }
+        out.push('\n');
+    }
     Ok(out)
 }
 
@@ -899,7 +1095,7 @@ mod tests {
         let mut c = ctx(&a);
         assert_eq!(
             thread(&mut c, &args("1xsjnud")).unwrap_err(),
-            Fail { code: 5, message: "the archive is rate limiting; try again in 40 s".into(), retry_after_s: Some(40) }
+            Fail { code: 5, message: "the archive is rate limiting; try again in 40 s".into(), retry_after_s: Some(40), coverage: None }
         );
         assert_eq!(thread(&mut c, &ThreadArgs { offline: true, ..args("1xsjnud") }).unwrap_err().code, 4);
         assert_eq!(thread(&mut c, &args("https://www.reddit.com/r/x/s/AbCdEf")).unwrap_err().code, 2);
@@ -1026,6 +1222,92 @@ mod tests {
         let f = search(&mut ctx(&a), &sargs("coil whine", &["a", "b"])).unwrap_err();
         assert_eq!((f.code, f.retry_after_s), (5, Some(12)));
         assert_eq!(a.log.borrow().len(), 1, "the second subreddit is not tried after a rate limit");
+        let f = search(&mut ctx(&a), &SearchArgs { json: true, ..sargs("coil whine", &["a", "b"]) }).unwrap_err();
+        let cov = f.coverage.expect("a stopped search still says what it covered");
+        assert_eq!((cov["rate_limited"].clone(), cov["not_reached"].clone()), (serde_json::json!(["a"]), serde_json::json!(["b"])));
+    }
+
+    const TIMEOUT: &str = r#"{"data":null,"error":"Timeout. Maybe slow down a bit"}"#;
+
+    #[test]
+    fn a_timed_out_subreddit_is_retried_narrower_and_the_coverage_says_so() {
+        // Only a query with a date window answers; the full-range query times out in every subreddit.
+        let a = arctic(Fixtures::default().route("after=", 200, &[], POSTS_SEARCH).route("posts/search", 422, &[], TIMEOUT));
+        let json = search(&mut ctx(&a), &SearchArgs { json: true, ..sargs("coil whine", &["a", "b", "c", "d", "e"]) }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cov = &v["coverage"];
+        assert_eq!((cov["answered"].clone(), cov["narrowed"].clone()), (serde_json::json!(["a"]), serde_json::json!(["a"])));
+        assert_eq!(cov["timed_out"], serde_json::json!(["b", "c", "d", "e"]), "the one retry is spent; the rest are reported, not retried");
+        let since = text::date(NOW - 180 * 86_400);
+        assert_eq!(cov["subreddits"][0]["after"], since.as_str());
+        assert!(cov["subreddits"][0]["narrowed"].as_str().unwrap().contains("older part of the range was dropped"));
+        // HEAD's worst case for five subreddits was 5 + its one blind retry: never more than that.
+        assert_eq!(a.log.borrow().len(), 6, "one narrower retry per run, and no blind retry on top");
+        assert!(v["sources"][0].as_str().unwrap().contains("narrowed after a timeout"));
+    }
+
+    #[test]
+    fn a_rate_limit_on_the_narrower_retry_is_not_retried_again() {
+        let a = arctic(Fixtures::default().route("after=", 429, &[("x-ratelimit-reset", "3")], "{}").route("posts/search", 422, &[], TIMEOUT));
+        let f = search(&mut ctx(&a), &SearchArgs { json: true, ..sargs("coil whine", &["a"]) }).unwrap_err();
+        assert_eq!(*a.log.borrow(), [("posts/search".to_owned(), 422), ("posts/search".to_owned(), 429)], "0.2.0 sent two here; so does this");
+        assert_eq!(f.coverage.unwrap()["rate_limited"], serde_json::json!(["a"]));
+    }
+
+    #[test]
+    fn a_narrower_retry_that_also_times_out_is_reported() {
+        let a = arctic(Fixtures::default().route("posts/search", 422, &[], TIMEOUT));
+        let f = search(&mut ctx(&a), &SearchArgs { json: true, ..sargs("coil whine", &["a", "b", "c"]) }).unwrap_err();
+        // a, a narrower, b, c: the same four requests the old once-per-run retry made.
+        assert_eq!(a.log.borrow().len(), 4);
+        let cov = f.coverage.unwrap();
+        assert_eq!(cov["timed_out"], serde_json::json!(["a", "b", "c"]));
+        assert_eq!(f.code, 3);
+    }
+
+    #[test]
+    fn narrowing_shortens_the_window_then_drops_words() {
+        let now = NOW;
+        let Some(Narrow::After(d, _)) = narrower("coil whine", None, None, now) else { panic!() };
+        assert_eq!(d, text::date(now - 180 * 86_400));
+        let Some(Narrow::After(d, _)) = narrower("coil whine", Some("2026-01-01"), Some("2026-11-01"), now) else { panic!() };
+        assert!(d.as_str() > "2026-05-01" && d.as_str() < "2026-07-01", "{d}");
+        let short = narrower("rx 9070 xt freeze", Some("2026-10-20"), Some("2026-11-01"), now);
+        assert_eq!(short, Some(Narrow::Text("rx 9070".into(), "searched for \"rx 9070\" only; dropped \"xt freeze\"".into())));
+        assert_eq!(narrower("\"exact phrase here\"", Some("2026-10-20"), None, now), None, "a quoted phrase is not cut");
+        assert_eq!(narrower("two words", Some("2026-10-20"), None, now), None);
+    }
+
+    #[test]
+    fn the_budget_warning_comes_before_anything_is_sent() {
+        let b = |used, blocked, frees| Budget { used, cap: 10, window_ms: 60_000, blocked_until_ms: blocked, frees_at_ms: frees };
+        assert_eq!(budget_warning(&b(2, None, None), 5, 0), None);
+        let low = budget_warning(&b(8, None, None), 5, 0).unwrap();
+        assert!(low.starts_with("budget low: 2 of 10 requests left this minute"), "{low}");
+        let full = budget_warning(&b(10, None, Some(30_500)), 1, 0).unwrap();
+        assert!(full.ends_with("the next slot frees in 31 s"), "{full}");
+        assert!(budget_warning(&b(0, Some(74_000), None), 1, 0).unwrap().starts_with("rate limited, retry in 74 s"));
+    }
+
+    #[test]
+    fn sources_shows_the_shared_budget_and_search_reports_it() {
+        let dir = std::env::temp_dir().join(format!("rdt-run-test-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.sqlite");
+        let clock = FakeClock::default();
+        clock.advance(NOW as u64 * 1000);
+        let a = Arctic::new(Fixtures::default().route("posts/search", 200, &[], POSTS_SEARCH), clock).with_ledger(Box::new(Store::open(&path).unwrap()));
+        let c = Ctx { store: Store::open(&path).unwrap(), arctic: &a, now: NOW, nonce: "ab12cd" };
+        let out = sources(&c).unwrap();
+        assert!(out.contains("budget   9 of 10 requests left this minute, shared by every rdt run on this PC"), "{out}");
+        // Another run's 429 is seen here: the search sends nothing and says why.
+        Store::open(&path).unwrap().block_until(a.now_ms() + 40_000).unwrap();
+        let mut c = c;
+        let f = search(&mut c, &SearchArgs { json: true, ..sargs("coil whine", &["a"]) }).unwrap_err();
+        assert_eq!((f.code, a.log.borrow().len()), (5, 1), "only sources' one request was sent");
+        assert!(f.coverage.unwrap()["budget_note"].as_str().unwrap().starts_with("rate limited, retry in 40 s"));
+        drop(c);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1248,11 +1530,33 @@ mod tests {
         let mut c = ctx(&a);
         thread(&mut c, &args("1xsjnud")).unwrap();
         // The cached thread is about coil whine on a 9060 XT; a question about 9070 XT fan curves shares only "xt".
-        let f = subs(&mut c, &SubsArgs { offline: true, ..subargs("9070 xt fan curve", &[]) }).unwrap_err();
-        assert_eq!(f.code, 3, "{}", f.message);
+        // Only the starter list speaks, then: the off-topic cached thread is not counted.
+        let off = subs(&mut c, &SubsArgs { offline: true, ..subargs("9070 xt fan curve", &[]) }).unwrap();
+        assert!(!off.contains("cached thread") && off.contains("starter list (9070)"), "{off}");
+        assert_eq!(subs(&mut c, &SubsArgs { offline: true, ..subargs("sourdough proofing", &[]) }).unwrap_err().code, 3);
         assert!(subs(&mut c, &SubsArgs { offline: true, ..subargs("sapphire coil whine", &[]) }).unwrap().contains("r/AMDHelp"));
         // Plurals and filler words must not turn an on-topic thread away.
         assert!(subs(&mut c, &SubsArgs { offline: true, ..subargs("how to fix the coil whines on sapphire cards", &[]) }).unwrap().contains("r/AMDHelp"));
+    }
+
+    #[test]
+    fn subs_works_from_the_starter_list_without_urls_and_asks_nothing_for_it() {
+        let a = arctic(Fixtures::default());
+        let out = subs(&mut ctx(&a), &SubsArgs { offline: true, ..subargs("RX 9070 XT hard freeze cyberpunk", &[]) }).unwrap();
+        assert!(out.contains("starter list (rx)"), "{out}");
+        assert!(out.contains("--sub radeon,AMDHelp,Amd,cyberpunkgame"), "hardware and the game first: {out}");
+        assert!(out.contains(" --after "), "unknown sizes get a year's window: {out}");
+        // Online, the starter names cost no lookups: only the old topic-word lookups (at most two) may be sent.
+        let b = arctic(Fixtures::default().route("subreddits/search", 200, &[], r#"{"data":[]}"#));
+        let json = subs(&mut ctx(&b), &SubsArgs { json: true, ..subargs("RX 9070 XT hard freeze cyberpunk", &[]) }).unwrap();
+        assert!(b.log.borrow().len() <= MAX_NAME_LOOKUPS, "{:?}", b.log.borrow());
+        assert!(json.contains("\"starter\":\"rx\""), "{json}");
+        // With any real evidence (a URL), the list stays out of it.
+        let c = arctic(Fixtures::default());
+        let out =
+            subs(&mut ctx(&c), &SubsArgs { offline: true, ..subargs("RX 9070 XT freeze", &["https://www.reddit.com/r/pcmasterrace/comments/abc123/x/"]) })
+                .unwrap();
+        assert!(out.contains("--sub pcmasterrace\n") && !out.contains("starter list"), "{out}");
     }
 
     #[test]

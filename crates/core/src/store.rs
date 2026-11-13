@@ -13,11 +13,56 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A cached post with its source, when it was fetched, and when its comments were (if ever).
 pub type PostRow = (Post, String, i64, Option<i64>);
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Version 2 remembers what the archive said about a subreddit, so asking again costs no request.
 const SUBREDDIT_TABLE: &str = "CREATE TABLE subreddit(key TEXT PRIMARY KEY, name TEXT NOT NULL, subscribers INTEGER, over_18 INTEGER NOT NULL,
   description TEXT NOT NULL, posts INTEGER, in_archive INTEGER NOT NULL, checked_at INTEGER NOT NULL);";
+
+/// Version 3 makes the request log a machine-wide ledger: every `rdt` process books its request here, to the
+/// millisecond, before sending it, so parallel runs pace against each other instead of only against themselves.
+/// A booked request whose answer never came stays at status -1 and still counts.
+const LEDGER_COLUMNS: &str = "ALTER TABLE request_log ADD COLUMN at_ms INTEGER; CREATE INDEX request_log_at_ms ON request_log(at_ms);";
+
+/// The machine-wide pacing rules a booking follows.
+#[derive(Debug, Clone, Copy)]
+pub struct Pacing {
+    /// Least time between any two requests from this machine.
+    pub gap_ms: u64,
+    /// At most `cap` requests in any `window_ms`.
+    pub cap: u64,
+    pub window_ms: u64,
+}
+
+/// What the ledger says about the next request.
+#[derive(Debug, PartialEq)]
+pub enum Booking {
+    /// Booked: send at `send_at_ms` (now or later); `id` settles the row once the answer is in.
+    Slot { id: i64, send_at_ms: u64 },
+    /// Not booked, nothing recorded: the archive said it is rate limiting until then.
+    Blocked { until_ms: u64 },
+    /// Not booked, nothing recorded: the earliest free slot is further away than the caller will wait.
+    Busy { free_at_ms: u64 },
+}
+
+/// The machine-wide budget as of one moment.
+#[derive(Debug, PartialEq)]
+pub struct Budget {
+    /// Requests booked in the window that ends now (including any booked for a moment still ahead).
+    pub used: u64,
+    pub cap: u64,
+    pub window_ms: u64,
+    /// When the archive's last rate limit ends, if it has not ended yet.
+    pub blocked_until_ms: Option<u64>,
+    /// When a slot in the window frees up, if the window is full.
+    pub frees_at_ms: Option<u64>,
+}
+
+impl Budget {
+    pub fn left(&self) -> u64 {
+        self.cap.saturating_sub(self.used)
+    }
+}
 
 const SCHEMA: &str = "
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
@@ -89,17 +134,29 @@ impl Store {
     }
 
     fn init(db: Connection) -> Result<Store> {
+        // Several rdt processes may share this file; a booking holds the write lock for a moment only.
+        db.busy_timeout(std::time::Duration::from_secs(30))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
-        let has_meta: bool = db.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'meta'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
-        if !has_meta {
-            db.execute_batch(&format!("BEGIN; {SCHEMA} {SUBREDDIT_TABLE} INSERT INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}'); COMMIT;"))?;
-        }
-        let version: i64 = db.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get::<_, String>(0))?.parse().unwrap_or(0);
-        if version == 1 {
-            db.execute_batch(&format!("BEGIN; {SUBREDDIT_TABLE} UPDATE meta SET value = '2' WHERE key = 'schema_version'; COMMIT;"))?;
-        } else if version != SCHEMA_VERSION {
-            // A cache from a newer build is refused, never rewritten.
-            return Err(rusqlite::Error::InvalidParameterName(format!("cache schema version {version}, this build understands {SCHEMA_VERSION}")));
+        // Creating or upgrading happens under the write lock, with the version read inside it: two processes opening
+        // an old cache at once must not both try the same upgrade.
+        {
+            let tx = rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+            let has_meta: bool = tx.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'meta'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+            if !has_meta {
+                tx.execute_batch(&format!("{SCHEMA} {SUBREDDIT_TABLE} {LEDGER_COLUMNS} INSERT INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}');"))?;
+            }
+            let version: i64 = tx.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get::<_, String>(0))?.parse().unwrap_or(0);
+            if version == 1 {
+                tx.execute_batch(&format!("{SUBREDDIT_TABLE} UPDATE meta SET value = '2' WHERE key = 'schema_version';"))?;
+            }
+            if version == 1 || version == 2 {
+                // One way: a 0.2 build refuses a version 3 cache rather than rewrite it.
+                tx.execute_batch(&format!("{LEDGER_COLUMNS} UPDATE meta SET value = '3' WHERE key = 'schema_version';"))?;
+            } else if version != SCHEMA_VERSION {
+                // A cache from a newer build is refused, never rewritten.
+                return Err(rusqlite::Error::InvalidParameterName(format!("cache schema version {version}, this build understands {SCHEMA_VERSION}")));
+            }
+            tx.commit()?;
         }
         Ok(Store { db })
     }
@@ -400,8 +457,83 @@ impl Store {
     }
 
     pub fn log_request(&self, now: i64, source: &str, endpoint: &str, status: u16) -> Result<()> {
-        self.db.execute("INSERT INTO request_log VALUES (?1, ?2, ?3, ?4)", params![now, source, endpoint, status])?;
+        self.db.execute(
+            "INSERT INTO request_log(at, source, endpoint, status, at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now, source, endpoint, status, now.saturating_mul(1000)],
+        )?;
         Ok(())
+    }
+
+    /// Books the next request from this machine under `pacing`, inside one write transaction so two processes
+    /// can never take the same slot. A wait longer than `max_wait_ms` is not booked: nothing is recorded and the
+    /// caller is told when to come back. Times are milliseconds since the Unix epoch.
+    pub fn book_request(&self, now_ms: u64, source: &str, endpoint: &str, pacing: Pacing, max_wait_ms: u64) -> Result<Booking> {
+        self.book_request_with(&|| now_ms, source, endpoint, pacing, max_wait_ms)
+    }
+
+    /// The same, reading the clock only once the write lock is held: a process that waited for the lock must not
+    /// book from the moment it started waiting, or its slot would sit closer than the gap to the next one.
+    pub fn book_request_with(&self, clock: &dyn Fn() -> u64, source: &str, endpoint: &str, pacing: Pacing, max_wait_ms: u64) -> Result<Booking> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Immediate)?;
+        let now_ms = clock();
+        if let Some(until) = self.blocked_until(now_ms)? {
+            return Ok(Booking::Blocked { until_ms: until });
+        }
+        let last: Option<i64> = tx.query_row("SELECT max(at_ms) FROM request_log", [], |r| r.get(0))?;
+        let nth: Option<i64> = tx
+            .query_row("SELECT at_ms FROM request_log WHERE at_ms IS NOT NULL ORDER BY at_ms DESC LIMIT 1 OFFSET ?1", [pacing.cap.max(1) as i64 - 1], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let mut slot = now_ms;
+        if let Some(last) = last {
+            slot = slot.max((last.max(0) as u64).saturating_add(pacing.gap_ms));
+        }
+        if let Some(nth) = nth {
+            slot = slot.max((nth.max(0) as u64).saturating_add(pacing.window_ms));
+        }
+        if slot - now_ms > max_wait_ms {
+            return Ok(Booking::Busy { free_at_ms: slot });
+        }
+        tx.execute(
+            "INSERT INTO request_log(at, source, endpoint, status, at_ms) VALUES (?1, ?2, ?3, -1, ?4)",
+            params![(slot / 1000) as i64, source, endpoint, slot as i64],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Booking::Slot { id, send_at_ms: slot })
+    }
+
+    /// Records the answer to a booked request (0: no response at all).
+    pub fn settle_request(&self, id: i64, status: u16) -> Result<()> {
+        self.db.execute("UPDATE request_log SET status = ?1 WHERE rowid = ?2", params![status, id])?;
+        Ok(())
+    }
+
+    /// Remembers, for every process on this machine, that the archive is rate limiting until then.
+    /// A later answer never shortens an earlier, longer one.
+    pub fn block_until(&self, until_ms: u64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO meta VALUES ('archive_blocked_until_ms', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = CAST(max(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER)) AS TEXT)",
+            [until_ms.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn blocked_until(&self, now_ms: u64) -> Result<Option<u64>> {
+        let v: Option<String> = self.db.query_row("SELECT value FROM meta WHERE key = 'archive_blocked_until_ms'", [], |r| r.get(0)).optional()?;
+        Ok(v.and_then(|v| v.parse::<u64>().ok()).filter(|&t| t > now_ms))
+    }
+
+    /// The machine-wide budget at `now_ms`: bookings in the window that ends now, plus any booked for later.
+    pub fn budget(&self, now_ms: u64, pacing: Pacing) -> Result<Budget> {
+        let start = now_ms.saturating_sub(pacing.window_ms) as i64;
+        let times: Vec<i64> =
+            self.db.prepare("SELECT at_ms FROM request_log WHERE at_ms > ?1 ORDER BY at_ms")?.query_map([start], |r| r.get(0))?.collect::<Result<_>>()?;
+        let used = times.len() as u64;
+        let frees_at_ms = (used >= pacing.cap && pacing.cap > 0).then(|| times[(used - pacing.cap) as usize].max(0) as u64 + pacing.window_ms);
+        Ok(Budget { used, cap: pacing.cap, window_ms: pacing.window_ms, blocked_until_ms: self.blocked_until(now_ms)?, frees_at_ms })
     }
 
     pub fn requests_since(&self, since: i64) -> Result<i64> {
@@ -657,7 +789,7 @@ pub(crate) mod tests {
         s.save_thread(&thread(), "arctic", 100).unwrap();
         drop(s);
         // Make it look like a cache written by version 1: no subreddit table.
-        Connection::open(&path).unwrap().execute_batch("DROP TABLE subreddit; UPDATE meta SET value = '1' WHERE key = 'schema_version';").unwrap();
+        Connection::open(&path).unwrap().execute_batch("DROP TABLE subreddit; DROP INDEX request_log_at_ms; ALTER TABLE request_log DROP COLUMN at_ms; UPDATE meta SET value = '1' WHERE key = 'schema_version';").unwrap();
         let s = Store::open(&path).unwrap();
         assert_eq!(s.thread("p1").unwrap().unwrap().thread.comments.len(), 3);
         assert_eq!(s.subreddit("anything", 0, 0).unwrap(), None);
@@ -697,6 +829,82 @@ pub(crate) mod tests {
         s.log_request(100, "arctic", "posts/ids", 200).unwrap();
         s.log_request(200, "arctic", "comments/tree", 429).unwrap();
         assert_eq!(s.requests_since(150).unwrap(), 1);
+    }
+
+    const PACE: Pacing = Pacing { gap_ms: 2000, cap: 3, window_ms: 60_000 };
+
+    fn shared_file(tag: u32) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rdt-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("c.sqlite")
+    }
+
+    #[test]
+    fn two_processes_never_take_the_same_slot() {
+        let path = shared_file(line!());
+        // Two connections to one file stand for two rdt processes started at the same moment.
+        let (a, b) = (Store::open(&path).unwrap(), Store::open(&path).unwrap());
+        let now = 1_794_547_000_000;
+        let Booking::Slot { id, send_at_ms: first } = a.book_request(now, "arctic", "posts/search", PACE, 90_000).unwrap() else { panic!() };
+        let Booking::Slot { send_at_ms: second, .. } = b.book_request(now, "arctic", "posts/search", PACE, 90_000).unwrap() else { panic!() };
+        assert_eq!((first, second), (now, now + 2000), "the second process waits out the machine-wide gap");
+        a.settle_request(id, 200).unwrap();
+        let Booking::Slot { send_at_ms: third, .. } = a.book_request(now, "arctic", "x", PACE, 90_000).unwrap() else { panic!() };
+        assert_eq!(third, now + 4000);
+        // The window holds 3: the fourth waits until the first leaves it, and a caller unwilling to wait books nothing.
+        assert_eq!(b.book_request(now + 5000, "arctic", "x", PACE, 10_000).unwrap(), Booking::Busy { free_at_ms: now + 60_000 });
+        assert_eq!(b.budget(now + 5000, PACE).unwrap().used, 3, "a refused booking leaves no row");
+        let Booking::Slot { send_at_ms: fourth, .. } = b.book_request(now + 5000, "arctic", "x", PACE, 90_000).unwrap() else { panic!() };
+        assert_eq!(fourth, now + 60_000);
+        drop((a, b));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_rate_limit_is_shared_and_never_shortened() {
+        let path = shared_file(line!());
+        let (a, b) = (Store::open(&path).unwrap(), Store::open(&path).unwrap());
+        a.block_until(50_000).unwrap();
+        a.block_until(20_000).unwrap();
+        assert_eq!(b.blocked_until(10_000).unwrap(), Some(50_000));
+        assert_eq!(b.book_request(10_000, "arctic", "x", PACE, 90_000).unwrap(), Booking::Blocked { until_ms: 50_000 });
+        assert_eq!(b.budget(10_000, PACE).unwrap().used, 0, "a blocked request is not booked");
+        assert_eq!(b.blocked_until(50_000).unwrap(), None, "over once the moment passes");
+        assert!(matches!(b.book_request(50_000, "arctic", "x", PACE, 0).unwrap(), Booking::Slot { send_at_ms: 50_000, .. }));
+        drop((a, b));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn budget_counts_the_window_and_says_when_it_frees() {
+        let s = Store::memory().unwrap();
+        for t in [1_000u64, 3_000, 5_000] {
+            assert!(matches!(s.book_request(t, "arctic", "x", PACE, 0).unwrap(), Booking::Slot { .. }));
+        }
+        let b = s.budget(6_000, PACE).unwrap();
+        assert_eq!((b.used, b.left(), b.frees_at_ms, b.blocked_until_ms), (3, 0, Some(61_000), None));
+        let later = s.budget(62_000, PACE).unwrap();
+        assert_eq!((later.used, later.left(), later.frees_at_ms), (2, 1, None));
+    }
+
+    #[test]
+    fn a_version_2_cache_gains_the_ledger_and_keeps_its_log() {
+        let path = shared_file(line!());
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX request_log_at_ms; ALTER TABLE request_log DROP COLUMN at_ms; INSERT INTO request_log VALUES (100, 'arctic', 'posts/ids', 200);
+                 UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.requests_since(0).unwrap(), 1);
+        assert!(matches!(s.book_request(5_000_000, "arctic", "x", PACE, 0).unwrap(), Booking::Slot { .. }));
+        assert_eq!(s.requests_since(0).unwrap(), 2);
+        drop(s);
+        drop(Store::open(&path).unwrap());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

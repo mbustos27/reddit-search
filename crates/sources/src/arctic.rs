@@ -6,9 +6,14 @@
 //! retried here, and a refusal (401/403) is final. Confirmed against live responses on 2026-11-12:
 //! `{"data": [...]}` on success, `{"data": null, "error": "..."}` with status 422 on a query timeout,
 //! and `x-ratelimit-reset` (seconds) on every response.
+//!
+//! Machine-wide: with a `Ledger` (the cache's request log), every request is booked before it is sent, so all `rdt`
+//! processes on this PC share one pace: 2 s apart, at most 10 in any minute, and nothing at all while the archive's
+//! last rate limit is still running. A booking further off than the caller will wait is not made and nothing is sent.
 
 use crate::transport::{Clock, Transport};
 use reddit_core::model::{self, Comment, MoreStub, Post, Subreddit, Thread};
+use reddit_core::store::{Booking, Budget, Pacing, Store};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 
@@ -18,12 +23,49 @@ const GAP_MS: u64 = 2000;
 const ID_BATCH: usize = 500;
 const SHORT_WAIT_S: u64 = 10;
 const TIMEOUT_PAUSE_MS: u64 = 5000;
+/// The machine-wide pace every rdt process keeps. A dozen requests in a burst has locked us out for a minute or two;
+/// the archive's limit resets on the minute.
+pub const PACING: Pacing = Pacing { gap_ms: GAP_MS, cap: 10, window_ms: 60_000 };
+/// How long a request waits for a free slot in the machine-wide budget before giving up (longer with `--wait`).
+const SLOT_WAIT_MS: u64 = 60_000;
+/// The longest rate-limit wait believed from the archive's header.
+const MAX_REPORTED_WAIT_S: u64 = 3600;
+/// The longest a rate limit seen by one run holds back every other run on this PC.
+const MAX_SHARED_BLOCK_S: u64 = 300;
+
+/// Machine-wide bookkeeping of requests, shared by every `rdt` process: the cache's request log.
+pub trait Ledger {
+    /// `clock` is read once the ledger's lock is held. An `Err` means the request could not be booked.
+    fn book(&self, clock: &dyn Fn() -> u64, endpoint: &str, max_wait_ms: u64) -> Result<Booking, String>;
+    fn settle(&self, id: i64, status: u16);
+    fn block_until(&self, until_ms: u64);
+    fn budget(&self, now_ms: u64) -> Option<Budget>;
+}
+
+impl Ledger for Store {
+    fn book(&self, clock: &dyn Fn() -> u64, endpoint: &str, max_wait_ms: u64) -> Result<Booking, String> {
+        self.book_request_with(clock, NAME, endpoint, PACING, max_wait_ms).map_err(|e| e.to_string())
+    }
+    fn settle(&self, id: i64, status: u16) {
+        let _ = self.settle_request(id, status);
+    }
+    fn block_until(&self, until_ms: u64) {
+        let _ = Store::block_until(self, until_ms);
+    }
+    fn budget(&self, now_ms: u64) -> Option<Budget> {
+        Store::budget(self, now_ms, PACING).ok()
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
     /// The archive has no such thread.
     NotFound(String),
     RateLimited {
+        retry_after_s: u64,
+    },
+    /// Not sent: the requests every rdt process on this PC made in the last minute used up the shared budget.
+    Busy {
         retry_after_s: u64,
     },
     /// 401 or 403. Final: the tool does not try again in any other way.
@@ -41,6 +83,11 @@ impl std::fmt::Display for Error {
         match self {
             Error::NotFound(id) => write!(f, "the archive has no thread t3_{id}"),
             Error::RateLimited { retry_after_s } => write!(f, "the archive is rate limiting; try again in {retry_after_s} s"),
+            Error::Busy { retry_after_s } => write!(
+                f,
+                "request budget used up: {} requests a minute are shared by every rdt run on this PC; not sent, try again in {retry_after_s} s",
+                PACING.cap
+            ),
             Error::Refused(status) => write!(f, "the archive refused the request (HTTP {status}); not retrying"),
             Error::TooBroad(msg) => {
                 write!(f, "the archive timed out on this query ({msg}); wait a minute and try again, or narrow it with --after/--before or a smaller subreddit")
@@ -71,6 +118,8 @@ pub struct Arctic<T: Transport, C: Clock> {
     timeout_retry_left: Cell<bool>,
     /// (endpoint, status) of every request made, for the request log. Status 0 means no response.
     pub log: RefCell<Vec<(String, u16)>>,
+    /// Books every request machine-wide when set; it also records them, so `log` is then for this run only.
+    ledger: Option<Box<dyn Ledger>>,
 }
 
 fn encode(s: &str) -> String {
@@ -94,7 +143,43 @@ impl<T: Transport, C: Clock> Arctic<T, C> {
             max_wait_s: Cell::new(SHORT_WAIT_S),
             timeout_retry_left: Cell::new(true),
             log: RefCell::new(Vec::new()),
+            ledger: None,
         }
+    }
+
+    /// Paces every request against all rdt processes on this machine, through the ledger.
+    pub fn with_ledger(mut self, ledger: Box<dyn Ledger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    pub fn has_ledger(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    /// The machine-wide budget right now, when there is a ledger.
+    pub fn budget(&self) -> Option<Budget> {
+        self.ledger.as_ref().and_then(|l| l.budget(self.clock.now_ms()))
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The caller retries timed-out searches itself, narrower and per subreddit: the blind once-per-run retry is
+    /// switched off so a timeout is never retried twice.
+    pub fn take_timeout_retry(&self) {
+        self.timeout_retry_left.set(false);
+    }
+
+    /// The calm pause before a narrower retry of a query the archive timed out on.
+    pub fn pause_after_timeout(&self) {
+        self.clock.sleep_ms(TIMEOUT_PAUSE_MS);
+    }
+
+    /// Seconds from now until `at_ms`, rounded up.
+    fn secs_until(&self, at_ms: u64) -> u64 {
+        at_ms.saturating_sub(self.clock.now_ms()).div_ceil(1000)
     }
 
     /// Lets the caller choose patience: with `--wait`, a rate limit of up to this many seconds is waited out once.
@@ -127,11 +212,32 @@ impl<T: Transport, C: Clock> Arctic<T, C> {
                 self.clock.sleep_ms(GAP_MS - since);
             }
         }
+        let mut booked = None;
+        if let Some(ledger) = &self.ledger {
+            let clock = || self.clock.now_ms();
+            // A request the ledger cannot book is not sent: unbooked, other processes could not pace against it.
+            match ledger.book(&clock, endpoint, self.max_wait_s.get().saturating_mul(1000).max(SLOT_WAIT_MS)) {
+                Ok(Booking::Slot { id, send_at_ms }) => {
+                    let now = self.clock.now_ms();
+                    if send_at_ms > now {
+                        self.clock.sleep_ms(send_at_ms - now);
+                    }
+                    booked = Some(id);
+                }
+                Ok(Booking::Blocked { until_ms }) => return Err(Error::RateLimited { retry_after_s: self.secs_until(until_ms).max(1) }),
+                Ok(Booking::Busy { free_at_ms }) => return Err(Error::Busy { retry_after_s: self.secs_until(free_at_ms).max(1) }),
+                Err(e) => return Err(Error::Unavailable(format!("not sent: the request could not be booked in the cache's request log ({e})"))),
+            }
+        }
         let query: Vec<String> = params.iter().map(|(k, v)| format!("{k}={}", encode(v))).collect();
         let url = format!("{BASE}/api/{endpoint}?{}", query.join("&"));
         let result = self.transport.get(&url);
+        let status = result.as_ref().map_or(0, |r| r.status);
         self.last_ms.set(Some(self.clock.now_ms()));
-        self.log.borrow_mut().push((endpoint.to_owned(), result.as_ref().map_or(0, |r| r.status)));
+        self.log.borrow_mut().push((endpoint.to_owned(), status));
+        if let (Some(ledger), Some(id)) = (&self.ledger, booked) {
+            ledger.settle(id, status);
+        }
         let resp = result.map_err(Error::Unavailable)?;
         let json: Option<Value> = serde_json::from_str(&resp.body).ok();
         let message = json.as_ref().and_then(|j| j.get("error")).and_then(Value::as_str).unwrap_or("").to_owned();
@@ -141,7 +247,18 @@ impl<T: Transport, C: Clock> Arctic<T, C> {
                 _ => Err(Error::Unavailable("unexpected response shape".into())),
             },
             429 => {
-                Err(Error::RateLimited { retry_after_s: resp.header("x-ratelimit-reset").and_then(|v| v.parse::<f64>().ok()).map_or(60, |s| s.ceil() as u64) })
+                // The header is seconds to the minute's reset; a value far beyond that (a timestamp, "inf") is not
+                // believed, so one odd answer can never lock this PC out for long.
+                let retry_after_s = resp
+                    .header("x-ratelimit-reset")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|s| s.is_finite())
+                    .map_or(60, |s| s.ceil().clamp(0.0, MAX_REPORTED_WAIT_S as f64) as u64);
+                // Every other rdt process on this machine holds off until the archive's window resets.
+                if let Some(ledger) = &self.ledger {
+                    ledger.block_until(self.clock.now_ms().saturating_add(retry_after_s.min(MAX_SHARED_BLOCK_S) * 1000));
+                }
+                Err(Error::RateLimited { retry_after_s })
             }
             401 | 403 => Err(Error::Refused(resp.status)),
             200 | 400 | 422 if message.to_lowercase().contains("timeout") || message.to_lowercase().contains("timed out") => Err(Error::TooBroad(message)),
@@ -201,6 +318,11 @@ impl<T: Transport, C: Clock> Arctic<T, C> {
     /// Posts in one subreddit whose title or text matches, newest first (the archive cannot sort by relevance or score).
     pub fn search_posts(&self, q: &Query) -> Result<Vec<Post>, Error> {
         Ok(self.get("posts/search", &Self::search_params(q, "query")?)?.iter().filter_map(model::parse_post).collect())
+    }
+
+    /// The same, sent once with no retry of any kind: for a retry the caller already chose to make.
+    pub fn search_posts_once(&self, q: &Query) -> Result<Vec<Post>, Error> {
+        Ok(self.get_once("posts/search", &Self::search_params(q, "query")?)?.iter().filter_map(model::parse_post).collect())
     }
 
     /// Comments in one subreddit whose body matches, newest first.
@@ -327,6 +449,117 @@ mod tests {
         assert_eq!(long.posts_by_ids(&["x".into()]), Err(Error::RateLimited { retry_after_s: 48 }));
         assert_eq!(long.transport.calls.borrow().len(), 3);
         assert_eq!(long.clock.sleeps.borrow().iter().max(), Some(&49_000));
+    }
+
+    fn shared_cache(tag: u32) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rdt-src-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("c.sqlite")
+    }
+
+    fn with_ledger(f: Fixtures, path: &std::path::Path, start_ms: u64) -> Arctic<Fixtures, FakeClock> {
+        let a = Arctic::new(f, FakeClock::default()).with_ledger(Box::new(Store::open(path).unwrap()));
+        a.clock.advance(start_ms);
+        a
+    }
+
+    const T0: u64 = 1_794_547_000_000;
+
+    #[test]
+    fn two_runs_share_one_pace() {
+        let path = shared_cache(line!());
+        let a = with_ledger(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), &path, T0);
+        let b = with_ledger(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), &path, T0);
+        a.posts_by_ids(&["x".into()]).unwrap();
+        b.posts_by_ids(&["x".into()]).unwrap();
+        assert_eq!((a.clock.sleeps.borrow().len(), b.clock.sleeps.borrow().clone()), (0, vec![GAP_MS]), "the second process waits for the first one's gap");
+        let budget = a.budget().unwrap();
+        assert_eq!((budget.used, budget.left()), (2, PACING.cap - 2));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_rate_limit_seen_by_one_run_stops_the_others_without_a_request() {
+        let path = shared_cache(line!());
+        let a = with_ledger(Fixtures::default().route("posts/ids", 429, &[("x-ratelimit-reset", "48")], "{}"), &path, T0);
+        let b = with_ledger(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), &path, T0);
+        assert_eq!(a.posts_by_ids(&["x".into()]), Err(Error::RateLimited { retry_after_s: 48 }));
+        b.clock.advance(3000);
+        assert_eq!(b.posts_by_ids(&["x".into()]), Err(Error::RateLimited { retry_after_s: 45 }));
+        assert!(b.transport.calls.borrow().is_empty(), "nothing sent while the archive's limit runs");
+        // With patience (--wait), the rest of the limit is waited out once and the request then goes.
+        b.set_max_wait(90);
+        assert_eq!(b.posts_by_ids(&["x".into()]).unwrap().len(), 1);
+        assert_eq!(b.transport.calls.borrow().len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_odd_rate_limit_header_cannot_lock_the_pc_out() {
+        for (i, (header, reported)) in [("1794547000", MAX_REPORTED_WAIT_S), ("inf", 60), ("NaN", 60), ("-5", 0)].into_iter().enumerate() {
+            let path = shared_cache(line!() * 10 + i as u32);
+            let a = with_ledger(Fixtures::default().route("posts/ids", 429, &[("x-ratelimit-reset", header)], "{}"), &path, T0);
+            assert_eq!(a.posts_by_ids(&["x".into()]), Err(Error::RateLimited { retry_after_s: reported }), "header {header}");
+            let blocked = Store::open(&path).unwrap().blocked_until(0).unwrap();
+            assert!(blocked.is_some_and(|t| t <= T0 + MAX_SHARED_BLOCK_S * 1000), "header {header}: {blocked:?}");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    struct BrokenLedger;
+    impl Ledger for BrokenLedger {
+        fn book(&self, _: &dyn Fn() -> u64, _: &str, _: u64) -> Result<Booking, String> {
+            Err("disk I/O error".into())
+        }
+        fn settle(&self, _: i64, _: u16) {}
+        fn block_until(&self, _: u64) {}
+        fn budget(&self, _: u64) -> Option<Budget> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_request_the_ledger_cannot_book_is_not_sent() {
+        let a = Arctic::new(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), FakeClock::default()).with_ledger(Box::new(BrokenLedger));
+        assert!(matches!(a.posts_by_ids(&["x".into()]), Err(Error::Unavailable(m)) if m.contains("could not be booked")));
+        assert!(a.transport.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_clock_is_read_after_the_lock_is_taken() {
+        let path = shared_cache(line!());
+        let s = Store::open(&path).unwrap();
+        // A caller that waited for the lock books from the moment it got it, not from when it began to wait.
+        let reads = std::cell::Cell::new(0);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            T0 + 5000
+        };
+        assert!(matches!(s.book_request_with(&clock, NAME, "x", PACING, 0).unwrap(), Booking::Slot { send_at_ms, .. } if send_at_ms == T0 + 5000));
+        assert_eq!(reads.get(), 1);
+        drop(s);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_full_minute_is_waited_for_or_reported_but_never_exceeded() {
+        let path = shared_cache(line!());
+        let a = with_ledger(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), &path, T0);
+        for _ in 0..PACING.cap {
+            a.posts_by_ids(&["x".into()]).unwrap();
+        }
+        // The 11th request in the minute waits for the first to leave the window: 60 s after it, never sooner.
+        a.posts_by_ids(&["x".into()]).unwrap();
+        assert_eq!(a.clock.now_ms(), T0 + 60_000);
+        // Another process that finds the minute full and would have to wait past its patience sends nothing.
+        let b = with_ledger(Fixtures::default().route("posts/ids", 200, &[], POSTS_IDS), &path, T0 + 60_000);
+        let store = Store::open(&path).unwrap();
+        for i in 0..PACING.cap {
+            assert!(matches!(store.book_request(T0 + 60_000 + 2000 * (i + 1), NAME, "x", PACING, u64::MAX).unwrap(), Booking::Slot { .. }));
+        }
+        assert!(matches!(b.posts_by_ids(&["x".into()]), Err(Error::Busy { .. })));
+        assert!(b.transport.calls.borrow().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

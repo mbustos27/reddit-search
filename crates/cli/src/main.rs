@@ -187,12 +187,10 @@ fn main() {
             std::fs::create_dir_all(dir).map_err(|e| Fail::new(6, format!("cannot create {}: {e}", dir.display())))?;
         }
         let store = Store::open(&path).map_err(|e| Fail::new(6, format!("cannot open the cache at {}: {e}", path.display())))?;
-        // The archive's allowance is small, and an agent may run this tool many times in a row: wait out the gap
-        // since the previous run's last request before making any new one.
-        if store.last_request_at().ok().flatten().is_some_and(|at| (0..2).contains(&(now - at))) {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        let arctic = Arctic::new(Https::default(), SystemClock::default());
+        // The archive's allowance is small and several agents may run this tool at once: every request is booked in
+        // the cache's request log first (a second connection to the same file), so all rdt processes share one pace.
+        let ledger = Store::open(&path).map_err(|e| Fail::new(6, format!("cannot open the cache at {}: {e}", path.display())))?;
+        let arctic = Arctic::new(Https::default(), SystemClock).with_ledger(Box::new(ledger));
         if cli.wait {
             arctic.set_max_wait(90);
         }
@@ -253,7 +251,7 @@ fn main() {
         Ok(text) => print!("{text}"),
         Err(f) => {
             if json {
-                println!("{}", serde_json::json!({"ok": false, "code": f.code, "error": f.message, "retry_after_s": f.retry_after_s}));
+                println!("{}", serde_json::json!({"ok": false, "code": f.code, "error": f.message, "retry_after_s": f.retry_after_s, "coverage": f.coverage}));
             }
             eprintln!("rdt: {}", f.message);
             std::process::exit(f.code);

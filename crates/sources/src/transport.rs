@@ -1,7 +1,7 @@
 //! HTTP behind a trait, with a real HTTPS client and a replaying one for tests. Also the clock, so pacing is testable.
 
 use std::cell::{Cell, RefCell};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -26,17 +26,13 @@ pub trait Clock {
     fn sleep_ms(&self, ms: u64);
 }
 
-pub struct SystemClock(Instant);
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        SystemClock(Instant::now())
-    }
-}
+/// Wall-clock milliseconds since the Unix epoch, so that separate processes can compare times in the shared ledger.
+#[derive(Default)]
+pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        self.0.elapsed().as_millis() as u64
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
     }
     fn sleep_ms(&self, ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
